@@ -1,0 +1,233 @@
+# Generated from approved golden template github_actions:apex-delivery
+# Apex service svc_45eb0356-8cdc-4cdc-b48e-ea5b30909941 (binding dlvb_0b0102c5-0d7e-42fe-a957-98d837354235). Review before publish.
+# Temporary static push key (Apex exception, expires 2026-11-23T23:59:00Z): build and scan read GitHub secrets APEX_ECR_PUSH_ACCESS_KEY_ID and APEX_ECR_PUSH_SECRET_ACCESS_KEY; deploy keeps GitHub OIDC.
+# The two secrets must be repository secrets (or organization secrets visible to this repository), not environment secrets; build and scan fail when either is empty
+# and at or after the expiry (also on a GitHub re-run).
+name: "videoapi Helio delivery"
+run-name: ${{ inputs.helio_execution_id || github.sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      helio_execution_id:
+        required: true
+        type: string
+      helio_release_id:
+        required: true
+        type: string
+      release_version:
+        required: false
+        type: string
+      workflow_revision:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: "helio-delivery-videoapi"
+  cancel-in-progress: false
+env:
+  AWS_REGION: "us-east-2"
+  ECR_REPOSITORY: "helio/videoapi-dev-us-east-2"
+  ECR_REGISTRY: "149511939668.dkr.ecr.us-east-2.amazonaws.com"
+  HELIO_BINDING_ID: "dlvb_0b0102c5-0d7e-42fe-a957-98d837354235"
+  APEX_REQUEST_URL: "https://dagly.io/apex/api/v1/delivery/requests"
+  APEX_TOKEN_HEADER: "x-helio-delivery-token"
+  OIDC_AUDIENCE: "helio-delivery"
+  DOCKERFILE: "Dockerfile"
+  BUILD_CONTEXT: "."
+jobs:
+  test:
+    name: Test
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse a run of another commit
+        env:
+          WANT: ${{ inputs.workflow_revision }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || [ -z "$WANT" ] || [ "$GITHUB_SHA" != "$WANT" ]; then echo "::error::Only a Helio Start of the approved commit runs: event $GITHUB_EVENT_NAME, run $GITHUB_SHA, Helio approved ${WANT:-nothing}"; exit 1; fi
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build and run tests
+        run: "mvn -B verify"
+  build:
+    name: Build
+    needs:
+      - test
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Refuse an expired temporary static push key
+        run: |
+          if [ "$(date -u +%s)" -ge 1795478340 ]; then echo "::error::Apex's temporary static push key expired (epoch 1795478340); nothing is pushed with it"; exit 1; fi
+      - name: Refuse a run of another commit
+        env:
+          WANT: ${{ inputs.workflow_revision }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || [ -z "$WANT" ] || [ "$GITHUB_SHA" != "$WANT" ]; then echo "::error::Only a Helio Start of the approved commit runs: event $GITHUB_EVENT_NAME, run $GITHUB_SHA, Helio approved ${WANT:-nothing}"; exit 1; fi
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check the temporary static push key secrets are set
+        env:
+          HELIO_PUSH_KEY_ID: ${{ secrets.APEX_ECR_PUSH_ACCESS_KEY_ID }}
+          HELIO_PUSH_KEY_SECRET: ${{ secrets.APEX_ECR_PUSH_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$HELIO_PUSH_KEY_ID" ] || [ -z "$HELIO_PUSH_KEY_SECRET" ]; then echo "::error::The static push key secrets APEX_ECR_PUSH_ACCESS_KEY_ID and APEX_ECR_PUSH_SECRET_ACCESS_KEY are empty or not visible to this job; they must be repository secrets (or organization secrets visible to this repository), not environment secrets"; exit 1; fi
+      - name: "AWS credentials by temporary static push key (expires 2026-11-23T23:59:00Z)"
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+        with:
+          aws-access-key-id: ${{ secrets.APEX_ECR_PUSH_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.APEX_ECR_PUSH_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64
+      - name: Build and push by digest
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          if [ "$REGISTRY" != "$ECR_REGISTRY" ]; then echo "::error::The static push key logged in to $REGISTRY, not the target's registry $ECR_REGISTRY; nothing was pushed"; exit 1; fi
+          image="$REGISTRY/$ECR_REPOSITORY"
+          docker build --platform linux/amd64 -f "$DOCKERFILE" -t "$image:$GITHUB_SHA" "$BUILD_CONTEXT"
+          docker push "$image:$GITHUB_SHA" > /dev/null
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$GITHUB_SHA" | sed 's/.*@//')
+          case "$digest" in sha256:*) ;; *) echo '::error::Could not resolve the pushed image digest'; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+  scan:
+    name: Scan
+    needs:
+      - build
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse an expired temporary static push key
+        run: |
+          if [ "$(date -u +%s)" -ge 1795478340 ]; then echo "::error::Apex's temporary static push key expired (epoch 1795478340); nothing is pushed with it"; exit 1; fi
+      - name: Check the temporary static push key secrets are set
+        env:
+          HELIO_PUSH_KEY_ID: ${{ secrets.APEX_ECR_PUSH_ACCESS_KEY_ID }}
+          HELIO_PUSH_KEY_SECRET: ${{ secrets.APEX_ECR_PUSH_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$HELIO_PUSH_KEY_ID" ] || [ -z "$HELIO_PUSH_KEY_SECRET" ]; then echo "::error::The static push key secrets APEX_ECR_PUSH_ACCESS_KEY_ID and APEX_ECR_PUSH_SECRET_ACCESS_KEY are empty or not visible to this job; they must be repository secrets (or organization secrets visible to this repository), not environment secrets"; exit 1; fi
+      - name: "AWS credentials by temporary static push key (expires 2026-11-23T23:59:00Z)"
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+        with:
+          aws-access-key-id: ${{ secrets.APEX_ECR_PUSH_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.APEX_ECR_PUSH_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64
+      - name: Scan the pushed image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: trivy image --quiet --ignore-unfixed --exit-code 1 --severity CRITICAL "$REGISTRY/$ECR_REPOSITORY@$IMAGE_DIGEST"
+  deploy:
+    name: Deploy
+    needs:
+      - build
+      - scan
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    environment: "development"
+    permissions:
+      contents: read
+      deployments: write
+      id-token: write
+    outputs:
+      delivery: ${{ steps.deliver.outputs.delivery }}
+    steps:
+      - name: Request delivery through Apex and wait
+        id: deliver
+        env:
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Apex accepts the image by digest only (delivery.image_rule); checked before any call.
+          if ! printf '%s' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then echo "::error::Image digest is not sha256:<64 lowercase hex>; nothing was sent to Apex"; exit 1; fi
+          oidc() { curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_AUDIENCE" | jq -r .value; }
+          APEX_BODY=$(mktemp)
+          apex_call() { m=$1; u=$2; shift 2; curl -sS -m 30 -o "$APEX_BODY" -w '%{http_code}' -X "$m" "$u" -H "$APEX_TOKEN_HEADER: $(oidc)" "$@" || true; }
+          apex_field() { jq -r --arg p "$1" 'try (getpath($p | split(".")) // "" | tostring | gsub("[\r\n]+"; " ") | .[0:500]) catch ""' "$APEX_BODY" 2>/dev/null || true; }
+          reads=0
+          endpoint_check() { jq -n --arg c "$GITHUB_SHA" --arg t "apex delivery status $id" --argjson s "$1" --argjson h "$2" --argjson a "$reads" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{schema:"helio.endpoint-check/1", commit:$c, target:$t, http_status:$s, healthy:$h, checked_at:$at, attempts:$a}' > helio-endpoint-check.json; cat helio-endpoint-check.json; echo 'endpoint_checked=true' >> "$GITHUB_OUTPUT"; }
+          in_account_check() {
+            if [ "$(jq -r '.result.running // 0' "$APEX_BODY" 2>/dev/null || echo 0)" -ge 1 ] 2>/dev/null || [ "$(apex_field result.rollout)" = "COMPLETED" ]; then endpoint_check 200 true; return 0; fi
+            endpoint_check 0 false; echo '::error::Apex reported deployed without a running task or a completed rollout'; return 1
+          }
+          request=$(jq -cn --arg b "$HELIO_BINDING_ID" --arg d "$IMAGE_DIGEST" '{binding_id:$b, image_digest:$d}')
+          code=$(apex_call POST "$APEX_REQUEST_URL" -H 'Content-Type: application/json' -H "Idempotency-Key: $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" -d "$request")
+          case "$code" in
+            2??) ;;
+            *) echo "::error::Apex refused the delivery (HTTP $code $(apex_field code)): $(apex_field error)"; echo 'Nothing is retried: Helio fails the delivery with the reason above.'; exit 1 ;;
+          esac
+          id=$(apex_field id)
+          if ! printf '%s' "$id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'; then echo '::error::Apex answered without a delivery id Helio can poll'; exit 1; fi
+          echo "delivery=$id" >> "$GITHUB_OUTPUT"
+          for _ in $(seq 1 80); do
+            code=$(apex_call GET "$APEX_REQUEST_URL/$id")
+            case "$code" in
+              200) reads=$((reads + 1)) ;;
+              000|429|5??) echo "status read: HTTP $code; reading again"; sleep 15; continue ;;
+              *) echo "::error::Apex refused the delivery status read (HTTP $code $(apex_field code)): $(apex_field error)"; exit 1 ;;
+            esac
+            status=$(apex_field status)
+            switch=$(apex_field starter_switch.status)
+            echo "status: $status${switch:+ (starter switch: $switch)}"
+            case "$status" in
+              deployed) in_account_check; exit $? ;;
+              failed|rolled_back|cancelled) endpoint_check 0 false; echo "::error::Apex delivery ended as $status${switch:+ (starter switch: $switch)}: $(apex_field reason)"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          [ "$reads" -ge 1 ] && endpoint_check 0 false
+          echo '::error::Timed out waiting for Apex delivery'; exit 1
+      - name: Publish Helio release evidence
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HELIO_EXECUTION_ID: ${{ inputs.helio_execution_id }}
+          HELIO_RELEASE_ID: ${{ inputs.helio_release_id }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+          ARTIFACT_REPOSITORY: "149511939668.dkr.ecr.us-east-2.amazonaws.com/helio/videoapi-dev-us-east-2"
+          ROLLBACK_WORKFLOW_ID: ".github/workflows/helio-delivery.yml"
+          DEPLOY_ENVIRONMENT: "development"
+        run: |
+          set -euo pipefail
+          # Helio records the delivery only from this deployment (task helio-forward-release, rollback_workflow_id below).
+          if [ -z "$HELIO_EXECUTION_ID" ] || ! printf '%s' "$HELIO_RELEASE_ID" | grep -Eq '^[0-9a-fA-F-]{36}$'; then echo '::error::No Helio release or execution id; Helio cannot record this delivery'; exit 1; fi
+          if [ "$WORKFLOW_REVISION" != "$GITHUB_SHA" ]; then echo '::error::workflow_revision is not the commit of this run; no evidence published'; exit 1; fi
+          if ! printf '%s' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then echo '::error::Image digest is not sha256:<64 lowercase hex>; no evidence published'; exit 1; fi
+          if ! printf '%s' "$ARTIFACT_REPOSITORY" | grep -Eq '^[a-z0-9.-]+/[a-z0-9._/-]+$'; then echo '::error::The ECR repository is not set; no evidence published'; exit 1; fi
+          body=$(jq -cn --arg ref "$GITHUB_SHA" --arg env "$DEPLOY_ENVIRONMENT" --arg e "$HELIO_EXECUTION_ID" --arg r "$HELIO_RELEASE_ID" --arg u "$ARTIFACT_REPOSITORY@$IMAGE_DIGEST" --arg d "$IMAGE_DIGEST" --arg w "$ROLLBACK_WORKFLOW_ID" --arg v "$WORKFLOW_REVISION" \
+            '{ref:$ref, auto_merge:false, required_contexts:[], environment:$env, task:"helio-forward-release", payload:{schema_version:1, helio_execution_id:$e, release_id:$r, artifact_uri:$u, artifact_digest:$d, rollback_workflow_id:$w, workflow_revision:$v}}')
+          code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -X POST "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/deployments" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' -d "$body" || true)
+          case "$code" in
+            201) echo 'Helio release evidence published' ;;
+            *) echo "::error::GitHub refused the Helio release evidence (HTTP $code); Helio cannot record this delivery"; exit 1 ;;
+          esac
+      - name: Keep the endpoint check
+        if: ${{ always() && steps.deliver.outputs.endpoint_checked == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: helio-endpoint-check
+          path: helio-endpoint-check.json
+          if-no-files-found: error
